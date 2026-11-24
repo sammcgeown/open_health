@@ -433,6 +433,9 @@ async fn main() -> Result<()> {
             | Command::Game { .. }
             | Command::Rdata { .. }
             | Command::FeatureMode { .. }
+            | Command::FeatureStatus
+            | Command::Features { .. }
+            | Command::Subscribe { .. }
     );
     if cli.key_file.is_none() && (uses_ring || matches!(cli.command, Command::Dashboard { .. })) {
         cli.key_file = discover_key(&cli.db)?;
