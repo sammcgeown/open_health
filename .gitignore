@@ -11,6 +11,7 @@ dna/files/*
 !dna/files/.gitkeep
 dna/scores/*
 !dna/scores/.gitkeep
+data/
 
 # Proprietary/decrypted ML models and mobile exports.
 notes/models/
