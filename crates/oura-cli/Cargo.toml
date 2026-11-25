@@ -19,6 +19,11 @@ oura-dna = { path = "../oura-dna" }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
+# HTTP layer for `oura dashboard`. Replaces the hand-rolled single-read server so
+# requests from a reverse proxy / ingress (headers and body split across reads,
+# bodies larger than 8 KiB) parse correctly. See crates/oura-cli/src/dashboard.rs.
+axum = "0.8"
+tokio-stream = "0.1"
 anyhow = "1"
 hex = "0.4"
 serde_json = "1"

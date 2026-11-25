@@ -1,6 +1,7 @@
 //! `oura` — a command-line client that reads data directly from an Oura ring over
 //! BLE, with no Oura cloud account. See `--help` for subcommands.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -256,6 +257,16 @@ enum Command {
         /// Local HTTP port.
         #[arg(long, default_value_t = 8090)]
         port: u16,
+        /// Address to bind the HTTP server to. Defaults to loopback (127.0.0.1) so
+        /// the dashboard stays local; pass 0.0.0.0 to serve on all interfaces (e.g.
+        /// inside a container, behind a reverse proxy or the Tailscale operator).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        /// Extra `Host` header value to accept besides loopback (repeatable). Needed
+        /// when the dashboard is reached through a proxy/ingress by name, e.g.
+        /// `--allowed-host health.example`. Loopback is always allowed.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
         /// Timezone offset (hours from UTC) for displayed times.
         #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
         tz_offset: f64,
@@ -501,6 +512,8 @@ async fn main() -> Result<()> {
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
         Command::Dashboard {
             port,
+            bind,
+            allowed_host,
             tz_offset,
             sex,
             age,
@@ -521,11 +534,13 @@ async fn main() -> Result<()> {
             // where the /blood explorer reads and caches local lab PDFs
             blood::set_files_dir(blood_files.clone());
             dashboard::serve(
+                *bind,
                 *port,
                 cli.db.clone(),
                 *tz_offset,
                 cli.name.clone(),
                 cli.key_file.clone(),
+                allowed_host.clone(),
                 seed,
             )
             .await

@@ -7,15 +7,25 @@
 //! run through the Python runners, shelled out exactly like `oura sessions`. All
 //! data stays on this machine.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
+use axum::{
+    body::{Body, Bytes},
+    extract::{Path as AxumPath, RawQuery, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+    Router,
+};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::net::TcpListener;
 
 use oura_summary::{
     bedtime_overrides_path, feature_modes_path, profile_path, write_bedtime_override, ModelInputs,
@@ -363,12 +373,26 @@ fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
     Ok(value)
 }
 
+/// Everything a request handler needs. Cheap to clone (the one allocation, the
+/// allowed-host list, is shared behind an `Arc`), so axum can hand each handler its
+/// own copy.
+#[derive(Clone)]
+struct AppState {
+    db: PathBuf,
+    tz: f64,
+    name: String,
+    key_file: Option<PathBuf>,
+    allowed_hosts: Arc<Vec<String>>,
+}
+
 pub async fn serve(
+    bind: IpAddr,
     port: u16,
     db: PathBuf,
     tz: f64,
     name: String,
     key_file: Option<PathBuf>,
+    allowed_hosts: Vec<String>,
     seed: Demographics,
 ) -> Result<()> {
     // seed profile.json from the CLI demographics on first run; afterwards the
@@ -376,17 +400,136 @@ pub async fn serve(
     if !profile_path(&db).exists() {
         let _ = write_profile(&db, &seed.to_json());
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    // Loopback Host values are always accepted, so the local UI keeps working
+    // exactly as before; `--allowed-host` only *adds* names for a proxy/ingress.
+    let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    hosts.extend(allowed_hosts);
+    let state = AppState {
+        db,
+        tz,
+        name,
+        key_file,
+        allowed_hosts: Arc::new(hosts),
+    };
+    let listener = TcpListener::bind((bind, port))
         .await
         .context("binding port")?;
-    println!("open_oura dashboard running — open http://127.0.0.1:{port} in your browser");
-    loop {
-        let (sock, _) = listener.accept().await?;
-        let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
-        tokio::spawn(async move {
-            let _ = handle(sock, port, db, tz, name, key_file).await;
-        });
+    println!("open_oura dashboard running — open http://{bind}:{port} in your browser");
+    axum::serve(listener, router(state))
+        .await
+        .context("serving dashboard")?;
+    Ok(())
+}
+
+/// One BLE operation at a time: `sync`, `feature` and `live-hr` shell out to our own
+/// binary, which owns the ring. Held while the subprocess runs.
+static BLE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn router(state: AppState) -> Router {
+    // static assets: on-disk under dashboard/web/ when present (editable without a
+    // recompile), else the copy embedded at build time — see `asset`.
+    macro_rules! file {
+        ($name:expr, $embed:expr, $ctype:expr) => {
+            get(|| async { asset_resp($name, $embed, $ctype) })
+        };
     }
+    const HTML: &str = "text/html; charset=utf-8";
+    const CSS: &str = "text/css; charset=utf-8";
+    const JS: &str = "text/javascript; charset=utf-8";
+    Router::new()
+        .route("/", file!("index.html", INDEX_HTML, HTML))
+        .route("/index.html", file!("index.html", INDEX_HTML, HTML))
+        .route("/styles.css", file!("styles.css", STYLES_CSS, CSS))
+        .route("/app.js", file!("app.js", APP_JS, JS))
+        .route("/dna", file!("dna.html", DNA_HTML, HTML))
+        .route("/dna.html", file!("dna.html", DNA_HTML, HTML))
+        .route("/dna.js", file!("dna.js", DNA_JS, JS))
+        .route("/dna.css", file!("dna.css", DNA_CSS, CSS))
+        .route("/blood", file!("blood.html", BLOOD_HTML, HTML))
+        .route("/blood.html", file!("blood.html", BLOOD_HTML, HTML))
+        .route("/blood.js", file!("blood.js", BLOOD_JS, JS))
+        .route("/blood.css", file!("blood.css", BLOOD_CSS, CSS))
+        .route("/icons/{*path}", get(icons))
+        // Liveness/readiness probe: cheap, never touches the DB or the models, and
+        // (via `guard`) answers without a valid Host so a kubelet probe using the
+        // pod IP still works.
+        .route(
+            "/healthz",
+            get(|| async { resp(StatusCode::OK, "text/plain; charset=utf-8", b"ok".to_vec()) }),
+        )
+        .route("/api/blood/report", get(api_blood_report))
+        .route("/api/blood/import-dir", post(api_blood_import_dir))
+        .route("/api/blood/import", post(api_blood_import))
+        .route("/api/dna/files", get(api_dna_files))
+        .route("/api/dna/report", get(api_dna_report))
+        .route("/api/dna/fetch", post(api_dna_fetch))
+        .route("/api/dna/lookup", get(api_dna_lookup))
+        .route("/api/summary", get(api_summary))
+        .route("/api/hourly-hr", get(api_hourly_hr))
+        .route("/api/research-export", get(api_research_export))
+        .route("/api/research-marker", post(api_research_marker))
+        .route("/api/profile", get(api_get_profile).post(api_post_profile))
+        .route("/api/bedtime", post(api_bedtime))
+        .route("/api/ring-key", get(api_get_ring_key).post(api_post_ring_key))
+        .route("/api/sync", post(api_sync))
+        .route("/api/live-hr", post(api_live_hr))
+        .route("/api/feature", post(api_feature))
+        .fallback(|| async { resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec()) })
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .with_state(state)
+}
+
+/// Host + CSRF guard, run before every route (replaces the inline checks the
+/// hand-rolled server did at the top of each request).
+async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    // Health probe must answer without a valid Host (a kubelet probe uses the pod IP).
+    if path == "/healthz" {
+        return next.run(req).await;
+    }
+    // Loopback / allowed-host guard (DNS-rebind protection).
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !st.allowed_hosts.iter().any(|h| h == host) {
+        return resp(StatusCode::FORBIDDEN, "text/plain", b"forbidden".to_vec());
+    }
+    // CSRF guard for mutating/disclosing endpoints: a same-origin fetch can set this
+    // header; an <img>/<form> or cross-origin fetch cannot (no CORS preflight is ever
+    // approved). GET /api/ring-key is guarded too — it discloses the ring auth key.
+    let csrf_ok = req.headers().contains_key("x-oura-dash");
+    let needs_csrf = matches!(
+        (req.method().as_str(), path.as_str()),
+        ("POST", "/api/profile")
+            | ("POST", "/api/research-marker")
+            | ("POST", "/api/bedtime")
+            | ("POST", "/api/sync")
+            | ("POST", "/api/live-hr")
+            | ("POST", "/api/feature")
+            | ("POST", "/api/ring-key")
+            | ("GET", "/api/ring-key")
+            | ("POST", "/api/dna/fetch")
+            | ("POST", "/api/blood/import-dir")
+            | ("POST", "/api/blood/import")
+    );
+    if needs_csrf && !csrf_ok {
+        return resp(StatusCode::FORBIDDEN, "text/plain", b"forbidden".to_vec());
+    }
+    next.run(req).await
+}
+
+/// Vendored SVG icons (Phosphor), served from disk under dashboard/web/icons/.
+async fn icons(AxumPath(path): AxumPath<String>) -> Response {
+    if path.ends_with(".svg") && !path.contains("..") {
+        if let Some(root) = repo_root() {
+            if let Ok(bytes) = std::fs::read(root.join("dashboard/web/icons").join(&path)) {
+                return resp(StatusCode::OK, "image/svg+xml", bytes);
+            }
+        }
+    }
+    resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec())
 }
 
 /// Serve a web asset: prefer the on-disk file under `dashboard/web/` (so the UI
@@ -442,423 +585,305 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
-    req.lines().find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+/// Build a response with the `no-store` cache policy the dashboard always uses.
+fn resp(status: StatusCode, ctype: &str, body: Vec<u8>) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .expect("valid response")
+}
+
+fn json_resp(v: &Value) -> Response {
+    resp(
+        StatusCode::OK,
+        "application/json",
+        serde_json::to_vec(v).unwrap_or_default(),
+    )
+}
+
+/// A single newline-delimited JSON line as a complete `application/x-ndjson` body —
+/// for the live-HR early replies (ring busy, or no auth key) the page consumes the
+/// same way it consumes the stream.
+fn ndjson_line(v: &Value) -> Response {
+    resp(
+        StatusCode::OK,
+        "application/x-ndjson",
+        format!("{v}\n").into_bytes(),
+    )
+}
+
+fn asset_resp(name: &str, embedded: &'static str, ctype: &str) -> Response {
+    resp(StatusCode::OK, ctype, asset(name, embedded))
+}
+
+fn busy_json() -> Value {
+    json!({
+        "ok": false,
+        "error": "Ring is busy; wait for the current operation to finish.",
+        "message": "Ring is busy; wait for the current operation to finish."
     })
 }
 
-async fn write_resp(sock: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    sock.write_all(head.as_bytes()).await?;
-    sock.write_all(body).await?;
-    Ok(())
-}
-
-async fn json_resp(sock: &mut TcpStream, v: &Value) -> Result<()> {
-    write_resp(
-        sock,
-        "200 OK",
-        "application/json",
-        serde_json::to_vec(v)?.as_slice(),
-    )
-    .await
-}
-
-async fn handle(
-    mut sock: TcpStream,
-    port: u16,
-    db: PathBuf,
-    tz: f64,
-    name: String,
-    key_file: Option<PathBuf>,
-) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = sock.read(&mut buf).await?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let method = req.split_whitespace().next().unwrap_or("GET");
-    let target = req.split_whitespace().nth(1).unwrap_or("/");
-    // route on the path only — a query string (e.g. cache-buster) must not 404 the API
-    let path = target.split('?').next().unwrap_or(target);
-    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-
-    // Loopback-only (DNS-rebind guard).
-    let host_ok = header(&req, "host")
-        .is_some_and(|h| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}"));
-    if !host_ok {
-        return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
-    }
-    // vendored SVG icons (Phosphor), served from disk
-    if path.starts_with("/icons/") && path.ends_with(".svg") && !path.contains("..") {
-        if let Some(root) = repo_root() {
-            if let Ok(bytes) = std::fs::read(
-                root.join("dashboard/web")
-                    .join(path.trim_start_matches('/')),
-            ) {
-                return write_resp(&mut sock, "200 OK", "image/svg+xml", &bytes).await;
-            }
-        }
-        return write_resp(&mut sock, "404 Not Found", "text/plain", b"not found").await;
-    }
-
-    // CSRF guard for mutating/action endpoints: a same-origin fetch can set this
-    // header; an <img>/<form> or cross-origin fetch cannot (CORS preflight we never approve).
-    // GET /api/ring-key is guarded too — it discloses the ring auth key, so only the
-    // dashboard's own same-origin page (which sets the header) may read it.
-    let csrf_ok = header(&req, "x-oura-dash").is_some();
-    let forbid = matches!(
-        (method, path),
-        ("POST", "/api/profile")
-            | ("POST", "/api/research-marker")
-            | ("POST", "/api/bedtime")
-            | ("POST", "/api/sync")
-            | ("POST", "/api/live-hr")
-            | ("POST", "/api/feature")
-            | ("POST", "/api/ring-key")
-            | ("GET", "/api/ring-key")
-            | ("POST", "/api/dna/fetch")
-            | ("POST", "/api/blood/import-dir")
-            | ("POST", "/api/blood/import")
-    ) && !csrf_ok;
-    if forbid {
-        return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
-    }
-
-    // A dashboard can own only one BLE operation at a time.
-    static BLE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _ble_guard = if method == "POST"
-        && matches!(path, "/api/sync" | "/api/live-hr" | "/api/feature")
-    {
-        match BLE_GATE.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                let busy = json!({"ok": false, "error": "Ring is busy; wait for the current operation to finish.", "message": "Ring is busy; wait for the current operation to finish."});
-                if path == "/api/live-hr" {
-                    // The live client consumes newline-delimited records.
-                    return write_resp(&mut sock, "200 OK", "application/x-ndjson", format!("{busy}\n").as_bytes()).await;
-                }
-                return json_resp(&mut sock, &busy).await;
-            }
-        }
-    } else {
-        None
-    };
-    let effective_tz = if tz == 0.0 {
+/// The browser's requested tz (query `?tz=`) is honoured only when the server wasn't
+/// pinned to a fixed offset (`--tz-offset 0`, which `local_tz_offset_hours()` returns
+/// in UTC containers). Mirrors the old inline logic.
+fn effective_tz(tz: f64, query: &str) -> f64 {
+    if tz == 0.0 {
         query_param(query, "tz")
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|h| h.is_finite() && (-24.0..=24.0).contains(h))
             .unwrap_or(tz)
     } else {
         tz
-    };
-    match (method, path) {
-        (_, "/") | (_, "/index.html") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/html; charset=utf-8",
-                &asset("index.html", INDEX_HTML),
+    }
+}
+
+/// Run a blocking, JSON-returning closure off the async executor (CPU/IO-heavy work:
+/// genome parsing, PDF scraping, EBI fetch) and wrap the result as a JSON response.
+async fn blocking_json<F>(f: F) -> Response
+where
+    F: FnOnce() -> Value + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => json_resp(&v),
+        Err(e) => json_resp(&json!({ "error": e.to_string() })),
+    }
+}
+
+// ── route handlers ─────────────────────────────────────────────────────────────
+// Each is the body of one arm of the old `handle` match; the host/CSRF checks and
+// the BLE gate that used to sit at the top of `handle` now live in `guard` and in
+// the three ring handlers respectively.
+
+async fn api_blood_report() -> Response {
+    blocking_json(crate::blood::report).await
+}
+
+async fn api_blood_import_dir() -> Response {
+    blocking_json(crate::blood::import_dir).await
+}
+
+async fn api_blood_import(body: String) -> Response {
+    let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+    let path = req["path"].as_str().unwrap_or("").to_string();
+    blocking_json(move || crate::blood::import_path(&path)).await
+}
+
+async fn api_dna_files() -> Response {
+    blocking_json(crate::dna::list_files).await
+}
+
+async fn api_dna_report(RawQuery(q): RawQuery) -> Response {
+    // parsing a genome is CPU/IO-heavy → off the async executor; cached per
+    // (genome, selected scores).
+    let query = q.unwrap_or_default();
+    let file = query_param(&query, "file").unwrap_or_default();
+    let scores = query_param(&query, "scores").unwrap_or_default();
+    blocking_json(move || crate::dna::report(&file, &scores)).await
+}
+
+async fn api_dna_fetch(body: String) -> Response {
+    // downloads a PUBLIC PGS Catalog score definition from EBI (no genome data
+    // leaves). CSRF-gated like the other action endpoints (see `guard`).
+    let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+    let id = req["pgs_id"].as_str().unwrap_or("").to_string();
+    blocking_json(move || crate::dna::fetch(&id)).await
+}
+
+async fn api_dna_lookup(RawQuery(q): RawQuery) -> Response {
+    let query = q.unwrap_or_default();
+    let file = query_param(&query, "file").unwrap_or_default();
+    let needle = query_param(&query, "q").unwrap_or_default();
+    blocking_json(move || crate::dna::lookup(&file, &needle)).await
+}
+
+async fn api_summary(State(st): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    // building the summary shells out to torch models → off the async executor;
+    // cached so only the first load (or post-sync/edit) pays for it.
+    let tz = effective_tz(st.tz, q.as_deref().unwrap_or(""));
+    let db = st.db.clone();
+    match tokio::task::spawn_blocking(move || cached_summary(&db, tz)).await {
+        Ok(Ok(v)) => json_resp(&v),
+        Ok(Err(e)) => json_resp(&json!({ "error": e.to_string() })),
+        Err(e) => json_resp(&json!({ "error": e.to_string() })),
+    }
+}
+
+async fn api_hourly_hr(State(st): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    // HR bars per `minutes` slot (default hourly, the iOS HeartRate screen's data);
+    // `days` = 0 → all of them, the day page picks out the day it shows.
+    let query = q.unwrap_or_default();
+    let tz = effective_tz(st.tz, &query);
+    let days = query_param(&query, "days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let minutes = query_param(&query, "minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let db = st.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        oura_summary::hourly_hr::hr_bins(&db, tz, days, minutes)
+    })
+    .await
+    {
+        Ok(Ok(v)) => json_resp(&v),
+        Ok(Err(e)) => json_resp(&json!({ "error": e.to_string() })),
+        Err(e) => json_resp(&json!({ "error": e.to_string() })),
+    }
+}
+
+async fn api_research_export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    // ZIP of raw per-beat / per-window CSVs for [start, end) — the same
+    // `research_export` the iOS app and `oura research-export` use.
+    let query = q.unwrap_or_default();
+    let base_tz = st.tz;
+    let db = st.db.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        use oura_summary::research_export as rx;
+        let num = |k: &str| query_param(&query, k).and_then(|v| v.parse::<f64>().ok());
+        let (Some(start), Some(end)) = (num("start"), num("end")) else {
+            return Ok::<_, anyhow::Error>(None); // → 400
+        };
+        let streams: Vec<_> = query_param(&query, "streams")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(rx::Stream::from_id)
+            .collect();
+        let tz = num("tz").unwrap_or(effective_tz(base_tz, &query));
+        let export = rx::build(
+            &db,
+            &rx::Request {
+                start_unix: start,
+                end_unix: end,
+                streams,
+                tz_offset_hours: tz,
+            },
+        )?;
+        let name = rx::bundle_name(start, tz);
+        Ok(Some((rx::to_zip(&export, &name)?, name)))
+    })
+    .await;
+    match built {
+        Ok(Ok(Some((zip, name)))) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/zip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}.zip\""),
             )
-            .await
-        }
-        (_, "/styles.css") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/css; charset=utf-8",
-                &asset("styles.css", STYLES_CSS),
-            )
-            .await
-        }
-        (_, "/app.js") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/javascript; charset=utf-8",
-                &asset("app.js", APP_JS),
-            )
-            .await
-        }
-        (_, "/dna") | (_, "/dna.html") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/html; charset=utf-8",
-                &asset("dna.html", DNA_HTML),
-            )
-            .await
-        }
-        (_, "/dna.js") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/javascript; charset=utf-8",
-                &asset("dna.js", DNA_JS),
-            )
-            .await
-        }
-        (_, "/dna.css") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/css; charset=utf-8",
-                &asset("dna.css", DNA_CSS),
-            )
-            .await
-        }
-        (_, "/blood") | (_, "/blood.html") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/html; charset=utf-8",
-                &asset("blood.html", BLOOD_HTML),
-            )
-            .await
-        }
-        (_, "/blood.js") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/javascript; charset=utf-8",
-                &asset("blood.js", BLOOD_JS),
-            )
-            .await
-        }
-        (_, "/blood.css") => {
-            write_resp(
-                &mut sock,
-                "200 OK",
-                "text/css; charset=utf-8",
-                &asset("blood.css", BLOOD_CSS),
-            )
-            .await
-        }
-        ("GET", "/api/blood/report") => {
-            let v = tokio::task::spawn_blocking(crate::blood::report)
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("POST", "/api/blood/import-dir") => {
-            let v = tokio::task::spawn_blocking(crate::blood::import_dir)
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("POST", "/api/blood/import") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            let path = req["path"].as_str().unwrap_or("").to_string();
-            let v = tokio::task::spawn_blocking(move || crate::blood::import_path(&path))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("GET", "/api/dna/files") => {
-            let v = tokio::task::spawn_blocking(crate::dna::list_files)
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("GET", "/api/dna/report") => {
-            // parsing a genome is CPU/IO-heavy → off the async executor; cached per
-            // (genome, selected scores).
-            let file = query_param(query, "file").unwrap_or_default();
-            let scores = query_param(query, "scores").unwrap_or_default();
-            let v = tokio::task::spawn_blocking(move || crate::dna::report(&file, &scores))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("POST", "/api/dna/fetch") => {
-            // downloads a PUBLIC PGS Catalog score definition from EBI (no genome
-            // data leaves). CSRF-gated like the other action endpoints.
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            let id = req["pgs_id"].as_str().unwrap_or("").to_string();
-            let v = tokio::task::spawn_blocking(move || crate::dna::fetch(&id))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("GET", "/api/dna/lookup") => {
-            let file = query_param(query, "file").unwrap_or_default();
-            let q = query_param(query, "q").unwrap_or_default();
-            let v = tokio::task::spawn_blocking(move || crate::dna::lookup(&file, &q))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            json_resp(&mut sock, &v).await
-        }
-        ("GET", "/api/summary") => {
-            // building the summary shells out to torch models → off the async
-            // executor; cached so only the first load (or post-sync/edit) pays for it.
-            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            match body {
-                Ok(v) => json_resp(&mut sock, &v).await,
-                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-            }
-        }
-        ("GET", "/api/hourly-hr") => {
-            // HR bars per `minutes` slot (default hourly, the iOS HeartRate screen's
-            // data); `days` = 0 → all of them, the day page picks out the day it shows
-            let days = query_param(query, "days")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let minutes = query_param(query, "minutes")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60);
-            let body = tokio::task::spawn_blocking(move || {
-                oura_summary::hourly_hr::hr_bins(&db, effective_tz, days, minutes)
-            })
-            .await
-            .map_err(|e| anyhow!(e))?;
-            match body {
-                Ok(v) => json_resp(&mut sock, &v).await,
-                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-            }
-        }
-        ("GET", "/api/research-export") => {
-            // ZIP of raw per-beat / per-window CSVs for [start, end) — the same
-            // `research_export` the iOS app and `oura research-export` use.
-            let num = |k: &str| query_param(query, k).and_then(|v| v.parse::<f64>().ok());
-            let (Some(start), Some(end)) = (num("start"), num("end")) else {
-                return write_resp(&mut sock, "400 Bad Request", "text/plain", b"start and end (unix seconds) are required").await;
-            };
-            let streams: Vec<_> = query_param(query, "streams")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(oura_summary::research_export::Stream::from_id)
-                .collect();
-            let tz = num("tz").unwrap_or(effective_tz);
-            let built = tokio::task::spawn_blocking(move || {
-                use oura_summary::research_export as rx;
-                let export = rx::build(&db, &rx::Request { start_unix: start, end_unix: end, streams, tz_offset_hours: tz })?;
-                let name = rx::bundle_name(start, tz);
-                Ok::<_, anyhow::Error>((rx::to_zip(&export, &name)?, name))
-            })
-            .await
-            .map_err(|e| anyhow!(e))?;
-            match built {
-                Ok((zip, name)) => {
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Disposition: attachment; filename=\"{name}.zip\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                        zip.len()
-                    );
-                    sock.write_all(head.as_bytes()).await?;
-                    sock.write_all(&zip).await?;
-                    Ok(())
-                }
-                Err(e) => write_resp(&mut sock, "400 Bad Request", "text/plain", e.to_string().as_bytes()).await,
-            }
-        }
-        ("POST", "/api/research-marker") => {
-            let label = serde_json::from_str::<Value>(body)
-                .ok()
-                .and_then(|v| v["label"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64 / 1000.0)
-                .unwrap_or(0.0);
-            match oura_summary::research_export::add_marker(&db, now, &label) {
-                Ok(()) => json_resp(&mut sock, &json!({ "ok": true, "unix": now })).await,
-                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-            }
-        }
-        ("GET", "/api/profile") => json_resp(&mut sock, &read_profile(&db).to_json()).await,
-        ("POST", "/api/profile") => {
-            match serde_json::from_str::<Value>(body.trim_end_matches('\0')) {
-                Ok(v) => match write_profile(&db, &v) {
-                    Ok(d) => json_resp(&mut sock, &d.to_json()).await,
-                    Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-                },
-                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-            }
-        }
-        ("POST", "/api/bedtime") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            let raw_start_ds = req["raw_start_ds"].as_i64();
-            let captured_unix = req["captured_unix"].as_i64();
-            let reset = req["reset"].as_bool().unwrap_or(false);
-            let (start_ds, end_ds) = if reset {
-                (None, None)
-            } else {
-                match (req["start_ds"].as_i64(), req["end_ds"].as_i64()) {
-                    (Some(s), Some(e)) => (Some(s), Some(e)),
-                    _ => {
-                        return json_resp(
-                            &mut sock,
-                            &json!({ "ok": false, "error": "start_ds and end_ds are required" }),
-                        )
-                        .await;
-                    }
-                }
-            };
-            let Some(raw_start_ds) = raw_start_ds else {
-                return json_resp(
-                    &mut sock,
-                    &json!({ "ok": false, "error": "raw_start_ds is required" }),
-                )
-                .await;
-            };
-            match write_bedtime_override(&db, raw_start_ds, captured_unix, start_ds, end_ds) {
-                Ok(v) => json_resp(&mut sock, &v).await,
-                Err(e) => {
-                    json_resp(&mut sock, &json!({ "ok": false, "error": e.to_string() })).await
-                }
-            }
-        }
-        ("GET", "/api/ring-key") => match read_ring_key(key_file.as_deref()) {
-            Ok(key) => json_resp(&mut sock, &json!({ "ok": true, "key": key })).await,
-            Err(e) => json_resp(&mut sock, &json!({ "ok": false, "message": e.to_string() })).await,
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(zip))
+            .expect("valid response"),
+        Ok(Ok(None)) => resp(
+            StatusCode::BAD_REQUEST,
+            "text/plain",
+            b"start and end (unix seconds) are required".to_vec(),
+        ),
+        Ok(Err(e)) => resp(StatusCode::BAD_REQUEST, "text/plain", e.to_string().into_bytes()),
+        Err(e) => resp(StatusCode::BAD_REQUEST, "text/plain", e.to_string().into_bytes()),
+    }
+}
+
+async fn api_research_marker(State(st): State<AppState>, body: String) -> Response {
+    let label = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["label"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64 / 1000.0)
+        .unwrap_or(0.0);
+    match oura_summary::research_export::add_marker(&st.db, now, &label) {
+        Ok(()) => json_resp(&json!({ "ok": true, "unix": now })),
+        Err(e) => json_resp(&json!({ "error": e.to_string() })),
+    }
+}
+
+async fn api_get_profile(State(st): State<AppState>) -> Response {
+    json_resp(&read_profile(&st.db).to_json())
+}
+
+async fn api_post_profile(State(st): State<AppState>, body: String) -> Response {
+    match serde_json::from_str::<Value>(body.trim_end_matches('\0')) {
+        Ok(v) => match write_profile(&st.db, &v) {
+            Ok(d) => json_resp(&d.to_json()),
+            Err(e) => json_resp(&json!({ "error": e.to_string() })),
         },
-        ("POST", "/api/ring-key") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            match write_ring_key(key_file.as_deref(), req["key"].as_str().unwrap_or("")) {
-                Ok(_) => json_resp(&mut sock, &json!({ "ok": true })).await,
-                Err(e) => {
-                    json_resp(&mut sock, &json!({ "ok": false, "message": e.to_string() })).await
-                }
+        Err(e) => json_resp(&json!({ "error": e.to_string() })),
+    }
+}
+
+async fn api_bedtime(State(st): State<AppState>, body: String) -> Response {
+    let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+    let raw_start_ds = req["raw_start_ds"].as_i64();
+    let captured_unix = req["captured_unix"].as_i64();
+    let reset = req["reset"].as_bool().unwrap_or(false);
+    let (start_ds, end_ds) = if reset {
+        (None, None)
+    } else {
+        match (req["start_ds"].as_i64(), req["end_ds"].as_i64()) {
+            (Some(s), Some(e)) => (Some(s), Some(e)),
+            _ => {
+                return json_resp(&json!({ "ok": false, "error": "start_ds and end_ds are required" }))
             }
         }
-        ("POST", "/api/sync") => {
-            let res =
-                tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
-                    .await
-                    .map_err(|e| anyhow!(e))?;
-            let v = match res {
-                Ok(msg) => json!({ "ok": true, "message": msg }),
-                Err(e) => json!({ "ok": false, "message": e.to_string() }),
-            };
-            json_resp(&mut sock, &v).await
-        }
-        ("POST", "/api/live-hr") => live_hr(&mut sock, &db, &name, key_file.as_deref()).await,
-        ("POST", "/api/feature") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            let feature = req["feature"].as_str().unwrap_or("").to_string();
-            let mode = req["mode"].as_str().unwrap_or("").to_string();
-            let res = tokio::task::spawn_blocking(move || {
-                run_feature(&db, &name, key_file.as_deref(), &feature, &mode)
-            })
-            .await
-            .map_err(|e| anyhow!(e))?;
-            let v = match res {
-                Ok(msg) => json!({ "ok": true, "message": msg }),
-                Err(e) => json!({ "ok": false, "message": e.to_string() }),
-            };
-            json_resp(&mut sock, &v).await
-        }
-        _ => write_resp(&mut sock, "404 Not Found", "text/plain", b"not found").await,
+    };
+    let Some(raw_start_ds) = raw_start_ds else {
+        return json_resp(&json!({ "ok": false, "error": "raw_start_ds is required" }));
+    };
+    match write_bedtime_override(&st.db, raw_start_ds, captured_unix, start_ds, end_ds) {
+        Ok(v) => json_resp(&v),
+        Err(e) => json_resp(&json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+async fn api_get_ring_key(State(st): State<AppState>) -> Response {
+    match read_ring_key(st.key_file.as_deref()) {
+        Ok(key) => json_resp(&json!({ "ok": true, "key": key })),
+        Err(e) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+    }
+}
+
+async fn api_post_ring_key(State(st): State<AppState>, body: String) -> Response {
+    let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+    match write_ring_key(st.key_file.as_deref(), req["key"].as_str().unwrap_or("")) {
+        Ok(_) => json_resp(&json!({ "ok": true })),
+        Err(e) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+    }
+}
+
+async fn api_sync(State(st): State<AppState>) -> Response {
+    let _guard = match BLE_GATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return json_resp(&busy_json()),
+    };
+    let (db, name, key_file) = (st.db.clone(), st.name.clone(), st.key_file.clone());
+    match tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref())).await {
+        Ok(Ok(msg)) => json_resp(&json!({ "ok": true, "message": msg })),
+        Ok(Err(e)) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+        Err(e) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+    }
+}
+
+async fn api_feature(State(st): State<AppState>, body: String) -> Response {
+    let _guard = match BLE_GATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return json_resp(&busy_json()),
+    };
+    let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+    let feature = req["feature"].as_str().unwrap_or("").to_string();
+    let mode = req["mode"].as_str().unwrap_or("").to_string();
+    let (db, name, key_file) = (st.db.clone(), st.name.clone(), st.key_file.clone());
+    match tokio::task::spawn_blocking(move || {
+        run_feature(&db, &name, key_file.as_deref(), &feature, &mode)
+    })
+    .await
+    {
+        Ok(Ok(msg)) => json_resp(&json!({ "ok": true, "message": msg })),
+        Ok(Err(e)) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+        Err(e) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
     }
 }
 
@@ -916,26 +941,46 @@ fn run_sync(db: &Path, name: &str, key_file: Option<&Path>) -> Result<String> {
 /// How long one dashboard live heart-rate session streams (the page can stop it early).
 const LIVE_HR_SECONDS: u64 = 60;
 
-/// Stream live heart rate as newline-delimited JSON while our own `live-hr`
-/// subcommand runs (BLE stays in the CLI, as for sync). Lines: `{"status":"live"}`
-/// once connected, `{"bpm":..,"ibi_ms":..}` per beat, then `{"done":true}` or
-/// `{"error":".."}`; the body ends with the connection. If the page stops early the
-/// child is killed, and the ring leaves live mode on its own within ~20 s.
-async fn live_hr(
-    sock: &mut TcpStream,
+/// Stream live heart rate as newline-delimited JSON. A spawned task owns the
+/// `oura live-hr` child (BLE stays in the CLI, as for sync) and feeds ndjson lines
+/// into the response body through a channel. Lines: `{"status":"live"}` once
+/// connected, `{"bpm":..,"ibi_ms":..}` per beat, then `{"done":true}` or
+/// `{"error":".."}`. When the browser disconnects, hyper drops the body, the channel
+/// receiver drops, the next `send_line` fails, and the child is killed
+/// (`kill_on_drop`) — the ring leaves live mode on its own within ~20 s. The BLE gate
+/// is held for the whole session by moving the guard into the task.
+async fn api_live_hr(State(st): State<AppState>) -> Response {
+    let guard = match BLE_GATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return ndjson_line(&busy_json()),
+    };
+    let Some(key_file) = st.key_file.clone() else {
+        return ndjson_line(&json!({
+            "error": "live heart rate needs the ring's auth key: start the dashboard with --key-file"
+        }));
+    };
+    let (db, name) = (st.db.clone(), st.name.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    tokio::spawn(async move {
+        let _guard = guard; // held until the session ends
+        let _ = live_hr_stream(&tx, &db, &name, &key_file).await;
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .expect("valid response")
+}
+
+async fn live_hr_stream(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     db: &Path,
     name: &str,
-    key_file: Option<&Path>,
+    key_file: &Path,
 ) -> Result<()> {
-    sock.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-    )
-    .await?;
-    let (mut rd, mut wr) = sock.split();
-    let Some(key_file) = key_file else {
-        let msg = "live heart rate needs the ring's auth key: start the dashboard with --key-file";
-        return send_line(&mut wr, &json!({ "error": msg })).await;
-    };
     let exe = std::env::current_exe().context("locating oura binary")?;
     let mut child = tokio::process::Command::new(&exe)
         .arg("--db")
@@ -957,23 +1002,17 @@ async fn live_hr(
     let stderr = child.stderr.take().context("child stderr")?;
     let stderr_task = tokio::spawn(read_stderr_tail(stderr));
     let mut lines = tokio::io::BufReader::new(child.stdout.take().context("child stdout")?).lines();
-    let mut probe = [0u8; 1];
     let session = tokio::time::timeout(std::time::Duration::from_secs(210), async {
-        loop {
-            tokio::select! {
-                line = lines.next_line() => {
-                    let Some(line) = line? else { break };
-                    let msg = if line.starts_with("Streaming live heart rate") {
-                        json!({ "status": "live" })
-                    } else if let Some((bpm, ibi_ms)) = parse_beat_line(&line) {
-                        json!({ "bpm": bpm, "ibi_ms": ibi_ms })
-                    } else { continue };
-                    send_line(&mut wr, &msg).await?;
-                }
-                n = rd.read(&mut probe) => if matches!(n, Ok(0) | Err(_)) {
-                    return Err(anyhow!("client disconnected"));
-                },
-            }
+        while let Some(line) = lines.next_line().await? {
+            let msg = if line.starts_with("Streaming live heart rate") {
+                json!({ "status": "live" })
+            } else if let Some((bpm, ibi_ms)) = parse_beat_line(&line) {
+                json!({ "bpm": bpm, "ibi_ms": ibi_ms })
+            } else {
+                continue;
+            };
+            // a send error means the browser hung up → stop; kill_on_drop reaps the child
+            send_line(tx, &msg).await?;
         }
         Ok::<_, anyhow::Error>(child.wait().await?.success())
     })
@@ -985,11 +1024,8 @@ async fn live_hr(
             let _ = child.kill().await;
             let _ = child.wait().await;
             stderr_task.abort();
-            return send_line(
-                &mut wr,
-                &json!({"error": "Live heart rate stopped or timed out."}),
-            )
-            .await;
+            let _ = send_line(tx, &json!({"error": "Live heart rate stopped or timed out."})).await;
+            return Ok(());
         }
     };
     let stderr = stderr_task.await.unwrap_or_default();
@@ -1002,7 +1038,8 @@ async fn live_hr(
             .unwrap_or("live heart rate failed");
         json!({ "error": msg.trim() })
     };
-    send_line(&mut wr, &last).await
+    let _ = send_line(tx, &last).await;
+    Ok(())
 }
 
 async fn read_stderr_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
@@ -1020,9 +1057,15 @@ async fn read_stderr_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Stri
     String::from_utf8_lossy(&tail).into_owned()
 }
 
-async fn send_line(wr: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<()> {
-    wr.write_all(format!("{v}\n").as_bytes()).await?;
-    Ok(())
+/// Push one ndjson line into the response body's channel. An `Err` means the
+/// receiver (the HTTP body) was dropped — i.e. the browser disconnected.
+async fn send_line(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    v: &Value,
+) -> Result<()> {
+    tx.send(Ok(Bytes::from(format!("{v}\n"))))
+        .await
+        .map_err(|_| anyhow!("live client disconnected"))
 }
 
 /// Parse one `oura live-hr` beat line, e.g. `  81 bpm (IBI 733 ms)`.
@@ -1119,6 +1162,7 @@ fn run_feature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn fallback_fills_only_null_nights_and_keeps_python_stages() {
