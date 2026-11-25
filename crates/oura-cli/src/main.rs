@@ -3,12 +3,15 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ble")]
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "ble")]
 use oura_link::ble::{self, BleTransport};
+#[cfg(feature = "ble")]
 use oura_link::OuraClient;
 use oura_store::storage::Store;
 
@@ -17,9 +20,12 @@ mod activity_model;
 mod blood;
 mod dashboard;
 mod dna;
+#[cfg(feature = "ble")]
 mod game;
+#[cfg(feature = "ble")]
 mod motion_server;
 mod pyrunner;
+#[cfg(feature = "ble")]
 mod viz;
 
 fn parse_tz_offset(value: &str) -> std::result::Result<f64, String> {
@@ -296,6 +302,7 @@ enum Command {
     },
 }
 
+#[cfg(feature = "ble")]
 fn feature_mode_name(mode: u8) -> &'static str {
     match mode {
         0 => "off",
@@ -306,6 +313,7 @@ fn feature_mode_name(mode: u8) -> &'static str {
     }
 }
 
+#[cfg(feature = "ble")]
 fn feature_state_name(state: u8) -> &'static str {
     match state {
         0 => "idle",
@@ -364,6 +372,7 @@ fn load_key(path: &Option<PathBuf>) -> Result<Option<[u8; 16]>> {
 }
 
 /// Generate a random 16-byte auth key from the OS CSPRNG.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
 fn generate_key() -> Result<[u8; 16]> {
     let mut key = [0u8; 16];
     getrandom::fill(&mut key)
@@ -372,6 +381,7 @@ fn generate_key() -> Result<[u8; 16]> {
 }
 
 /// Persist a key as hex with owner-only permissions.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
 fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
     std::fs::write(path, format!("{}\n", hex::encode(key)))
         .with_context(|| format!("writing key file {}", path.display()))?;
@@ -385,6 +395,7 @@ fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
 
 /// Open the readings store for best-effort live persistence, warning (rather than
 /// failing the command) if it can't be opened — but not pretending it succeeded.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
 fn open_store_or_warn(db: &Path) -> Option<Store> {
     match Store::open(db) {
         Ok(s) => Some(s),
@@ -398,6 +409,7 @@ fn open_store_or_warn(db: &Path) -> Option<Store> {
     }
 }
 
+#[cfg(feature = "ble")]
 async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
     let transport = BleTransport::connect(
         &cli.name,
@@ -410,6 +422,7 @@ async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
 }
 
 /// Authenticate if a key was supplied; returns whether auth was performed.
+#[cfg(feature = "ble")]
 async fn maybe_auth(client: &OuraClient<BleTransport>, key: &Option<[u8; 16]>) -> Result<bool> {
     if let Some(key) = key {
         client.authenticate(key).await.context("authenticating")?;
@@ -452,6 +465,7 @@ async fn main() -> Result<()> {
         cli.key_file = discover_key(&cli.db)?;
     }
     // Saved-data commands never need an auth key, even when one is configured.
+    #[cfg_attr(not(feature = "ble"), allow(unused_variables))]
     let key = if uses_ring {
         load_key(&cli.key_file)?
     } else {
@@ -459,24 +473,35 @@ async fn main() -> Result<()> {
     };
 
     match &cli.command {
+        #[cfg(feature = "ble")]
         Command::Scan => cmd_scan(&cli).await,
+        #[cfg(feature = "ble")]
         Command::Pair => cmd_pair(&cli).await,
+        #[cfg(feature = "ble")]
         Command::Info => cmd_info(&cli, &key).await,
+        #[cfg(feature = "ble")]
         Command::Sync { no_sync_time, .. } => cmd_sync(&cli, &key, !*no_sync_time).await,
+        #[cfg(feature = "ble")]
         Command::Latest => cmd_latest(&cli, &key).await,
+        #[cfg(feature = "ble")]
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
+        #[cfg(feature = "ble")]
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
+        #[cfg(feature = "ble")]
         Command::SleepAnalyze { force } => cmd_sleep_analyze(&cli, &key, *force).await,
+        #[cfg(feature = "ble")]
         Command::Viz { port, minutes } => {
             let client = connect(&cli).await?;
             maybe_auth(&client, &key).await?;
             viz::run(client, *port, *minutes).await
         }
+        #[cfg(feature = "ble")]
         Command::Game { port, minutes } => {
             let client = connect(&cli).await?;
             maybe_auth(&client, &key).await?;
             game::run(client, *port, *minutes).await
         }
+        #[cfg(feature = "ble")]
         Command::Rdata { action } => cmd_rdata(&cli, &key, action).await,
         Command::Events => cmd_events(&cli).await,
         Command::ResearchExport {
@@ -492,6 +517,7 @@ async fn main() -> Result<()> {
             println!("Re-decoded {decoded}/{total} stored events.");
             Ok(())
         }
+        #[cfg(feature = "ble")]
         Command::Features {
             enable_hr,
             enable_spo2,
@@ -507,8 +533,11 @@ async fn main() -> Result<()> {
             json,
         } => cmd_sleep_score(&cli, *tz_offset, csv.clone(), *json),
         Command::ReadinessScore { tz_offset, json } => cmd_readiness_score(&cli, *tz_offset, *json),
+        #[cfg(feature = "ble")]
         Command::Subscribe { feature, mode } => cmd_subscribe(&cli, &key, feature, mode).await,
+        #[cfg(feature = "ble")]
         Command::FeatureMode { feature, mode } => cmd_feature_mode(&cli, &key, feature, mode).await,
+        #[cfg(feature = "ble")]
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
         Command::Dashboard {
             port,
@@ -545,10 +574,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        // This binary was built without the `ble` feature (e.g. the dashboard server
+        // image): every ring command above is compiled out. The commands still parse
+        // so `--help` and error messages are unchanged; they just can't run here.
+        #[cfg(not(feature = "ble"))]
+        _ => anyhow::bail!(
+            "this build has no Bluetooth support (built with --no-default-features); \
+             ring commands need a build with the `ble` feature"
+        ),
     }
 }
 
 /// Subscribe a feature capability via SetFeatureSubscription (needs auth).
+#[cfg(feature = "ble")]
 async fn cmd_subscribe(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode: &str) -> Result<()> {
     use oura_protocol::protocol::{capability, subscription_mode};
     let cap = match feature {
@@ -595,6 +633,7 @@ async fn cmd_subscribe(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode: &
 /// Set a feature's operating mode (SetFeatureMode). The consumer-feature enable
 /// path — e.g. `feature-mode real_steps` turns on the on-ring step/gait DSP whose
 /// `real_steps_features` events (0x7e/0x7f) feed the steps_motion_decoder.
+#[cfg(feature = "ble")]
 async fn cmd_feature_mode(
     cli: &Cli,
     key: &Option<[u8; 16]>,
@@ -640,6 +679,7 @@ async fn cmd_feature_mode(
 }
 
 /// Read the actual on-ring mode/status of the data-producing features.
+#[cfg(feature = "ble")]
 async fn cmd_feature_status(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
     if !maybe_auth(&client, key).await? {
@@ -811,6 +851,7 @@ fn cmd_readiness_score(cli: &Cli, tz_offset: f64, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_features(
     cli: &Cli,
     key: &Option<[u8; 16]>,
@@ -858,6 +899,7 @@ async fn cmd_features(
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_scan(cli: &Cli) -> Result<()> {
     let found = ble::scan(&cli.name, Duration::from_secs(cli.scan_timeout)).await?;
     if found.is_empty() {
@@ -870,6 +912,7 @@ async fn cmd_scan(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_pair(cli: &Cli) -> Result<()> {
     let client = connect(cli).await?;
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
@@ -913,6 +956,7 @@ async fn cmd_pair(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_info(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
 
@@ -951,10 +995,12 @@ async fn cmd_info(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
 
+#[cfg(feature = "ble")]
 async fn drain_events_into_store(
     client: &OuraClient<BleTransport>,
     store: &Store,
@@ -1016,6 +1062,7 @@ async fn drain_events_into_store(
     Ok((outcome.events_synced, outcome.next_cursor))
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<()> {
     let key = key
         .as_ref()
@@ -1115,6 +1162,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
 
 /// A synthetic `time_sync` (0x42) row pairing the newest drained ring timestamp with
 /// the host clock; body and decoded shape match oura-core's phone anchor.
+#[cfg_attr(not(feature = "ble"), allow(dead_code))]
 fn phone_anchor_event(
     events_synced: u32,
     next_cursor: u32,
@@ -1137,6 +1185,7 @@ fn phone_anchor_event(
     })
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1179,6 +1228,7 @@ async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_live_hr(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, raw: bool) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1204,6 +1254,7 @@ async fn cmd_live_hr(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, raw: bool)
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_sleep_analyze(cli: &Cli, key: &Option<[u8; 16]>, force: bool) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1216,6 +1267,7 @@ async fn cmd_sleep_analyze(cli: &Cli, key: &Option<[u8; 16]>, force: bool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1253,6 +1305,7 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1293,6 +1346,7 @@ async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()
 /// stop and drain pages to measure the real byte rate and page size. **ALWAYS**
 /// tears down (stop + clear) even on error. Ring should be on the charger and
 /// still — sampling rate is fixed at 50 Hz regardless of motion.
+#[cfg(feature = "ble")]
 async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1403,6 +1457,7 @@ async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()>
 }
 
 /// RData status-code name (from the decompiled app's `RDataStatusCode`).
+#[cfg(feature = "ble")]
 fn rdata_status_name(s: u8) -> &'static str {
     match s {
         0 => "SUCCESS",
@@ -1417,6 +1472,7 @@ fn rdata_status_name(s: u8) -> &'static str {
 
 /// Test 1: run the app's strict start recipe — Clear (require SUCCESS) -> state ->
 /// CONFIGURE with startTime=0 — and report each status. Tears down afterward.
+#[cfg(feature = "ble")]
 async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1460,6 +1516,7 @@ async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
 /// try enabling it (subscription + feature-mode) on the correct id 0x12, then
 /// Clear -> Configure in the SAME session. If Configure is accepted, do a short
 /// capture and drain. Always tears down (stop/clear/unsubscribe).
+#[cfg(feature = "ble")]
 async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use oura_protocol::protocol::{capability, feature_mode, subscription_mode};
@@ -1542,6 +1599,7 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
 /// Try several RData `configure` argument variants and report which (if any)
 /// moves the ring out of the idle state (status 3). Each attempt is immediately
 /// torn down. Pure diagnostic for the Phase-2 spike — no long recording.
+#[cfg(feature = "ble")]
 async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1640,6 +1698,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(feature = "ble")]
     #[test]
     fn recognizes_ring5_rejected_history_cursor() {
         assert!(is_rejected_history_cursor(

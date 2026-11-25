@@ -12,7 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
-oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+# Bluetooth transport (btleplug). Optional + behind the default `ble` feature so the
+# k8s dashboard image can build with --no-default-features and no Bluetooth/dbus
+# stack. See docs/kubernetes-deployment.md (Component 4).
+oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781", optional = true }
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-summary = { path = "../oura-summary" }
 oura-dna = { path = "../oura-dna" }
@@ -40,6 +43,13 @@ getrandom = "0.3"
 tch = { version = "=0.22.0", optional = true } # pinned to libtorch 2.9.0 (repo venv)
 
 [features]
+default = ["ble"]
+# Bluetooth LE support (the oura-link/btleplug transport). On by default. Build the
+# dashboard server image with `--no-default-features` to drop btleplug and, on Linux,
+# its dbus dependency: the dashboard and every saved-data/offline command still work,
+# while the ring commands (scan, pair, sync, live-hr, feature-mode, rdata, viz, game,
+# …) are compiled out and report a clear error at runtime.
+ble = ["dep:oura-link"]
 # Run the activity model in-process via LibTorch instead of shelling out to
 # tools/run_activity_model.py. On Apple Silicon the only libtorch is the pip
 # wheel, so the repo venv is aligned to torch 2.9.0 — the exact version tch 0.22
