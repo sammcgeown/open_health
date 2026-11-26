@@ -20,6 +20,8 @@ mod activity_model;
 mod blood;
 mod dashboard;
 mod dna;
+mod ingest;
+mod push;
 #[cfg(feature = "ble")]
 mod game;
 #[cfg(feature = "ble")]
@@ -299,6 +301,25 @@ enum Command {
         /// via `$OURA_BLOOD_FILES`.
         #[arg(long, value_name = "DIR")]
         blood_files: Option<PathBuf>,
+        /// Enable the remote-ingest API (`/api/ingest/*`) using the bearer token in
+        /// this file. Without it the dashboard is local-only and those routes don't
+        /// exist. Needed when a Mac agent pushes to this server (e.g. in a pod). The
+        /// token is read from the file, never argv; also settable via
+        /// `$OURA_INGEST_TOKEN_FILE`.
+        #[arg(long, value_name = "FILE", env = "OURA_INGEST_TOKEN_FILE")]
+        ingest_token_file: Option<PathBuf>,
+    },
+    /// Push new local rows to a remote dashboard server's ingest API. Reads the local
+    /// DB read-only and sends everything past the server's watermark (idempotent). No
+    /// Bluetooth: run after `oura sync`. See docs/kubernetes-deployment.md.
+    Push {
+        /// Base URL of the dashboard server, e.g. https://health.example.
+        #[arg(long)]
+        server: String,
+        /// File holding the ingest bearer token (read from the file, never argv; also
+        /// settable via `$OURA_INGEST_TOKEN_FILE`).
+        #[arg(long, value_name = "FILE", env = "OURA_INGEST_TOKEN_FILE")]
+        token_file: PathBuf,
     },
 }
 
@@ -550,6 +571,7 @@ async fn main() -> Result<()> {
             weight,
             dna_files,
             blood_files,
+            ingest_token_file,
         } => {
             let seed = dashboard::Demographics {
                 sex: sex.chars().next().unwrap_or('M').to_ascii_uppercase(),
@@ -562,6 +584,12 @@ async fn main() -> Result<()> {
             dna::set_genomes_dir(dna_files.clone());
             // where the /blood explorer reads and caches local lab PDFs
             blood::set_files_dir(blood_files.clone());
+            let ingest_token = match ingest_token_file {
+                Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                    format!("reading ingest token file {}", path.display())
+                })?),
+                None => None,
+            };
             dashboard::serve(
                 *bind,
                 *port,
@@ -570,9 +598,27 @@ async fn main() -> Result<()> {
                 cli.name.clone(),
                 cli.key_file.clone(),
                 allowed_host.clone(),
+                ingest_token,
                 seed,
             )
             .await
+        }
+        Command::Push {
+            server,
+            token_file,
+        } => {
+            let token = std::fs::read_to_string(token_file)
+                .with_context(|| format!("reading ingest token file {}", token_file.display()))?;
+            let (db, server) = (cli.db.clone(), server.clone());
+            let summary = tokio::task::spawn_blocking(move || {
+                push::run(&db, &server, token.trim())
+            })
+            .await??;
+            println!(
+                "pushed {} serial(s): {} new event(s), {} new reading(s)",
+                summary.serials, summary.events_inserted, summary.readings_inserted
+            );
+            Ok(())
         }
         // This binary was built without the `ble` feature (e.g. the dashboard server
         // image): every ring command above is compiled out. The commands still parse

@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS readings (
     captured_unix INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_serial_kind ON readings(serial, kind);
+
+-- Remote-ingest high-water marks: per (serial, stream), the highest *source* row
+-- id this store has accepted from a pushing agent. Lets `oura push` resume with
+-- `id > source_id_max`; unused by a local Mac store. See docs/kubernetes-deployment.md.
+CREATE TABLE IF NOT EXISTS ingest_watermark (
+    serial        TEXT NOT NULL,
+    stream        TEXT NOT NULL,
+    source_id_max INTEGER NOT NULL,
+    PRIMARY KEY (serial, stream)
+);
 "#;
 
 fn now_unix() -> i64 {
@@ -112,6 +122,31 @@ pub fn decode_stored_event(
         return existing_decoded_json.map(ToOwned::to_owned);
     }
     None
+}
+
+/// One `events` row as it travels between a Mac store (source) and a server store
+/// (copy) during remote ingest. `source_id` is the source store's `events.id`, used
+/// only to drive the resume watermark; the row itself is inserted verbatim so the
+/// server holds a faithful copy (same `body`, `decoded_json`, `captured_unix`).
+#[derive(Debug, Clone)]
+pub struct IngestEvent {
+    pub source_id: i64,
+    pub tag: i64,
+    pub name: String,
+    pub ring_timestamp: i64,
+    pub body: Vec<u8>,
+    pub decoded_json: Option<String>,
+    pub captured_unix: i64,
+}
+
+/// One `readings` row for remote ingest (see [`IngestEvent`]).
+#[derive(Debug, Clone)]
+pub struct IngestReading {
+    pub source_id: i64,
+    pub kind: String,
+    pub value: f64,
+    pub unit: Option<String>,
+    pub captured_unix: i64,
 }
 
 /// A SQLite-backed store for ring data.
@@ -598,6 +633,215 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ── remote ingest ──────────────────────────────────────────────────────────
+    // Source side (`oura push`) reads rows past the server's watermark; the server
+    // inserts them and advances the watermark in one transaction. `INSERT OR IGNORE`
+    // (events) plus a monotonic per-stream watermark make every push idempotent, so a
+    // dropped connection just resends. Rows the server creates on its own (research
+    // markers, profile.json) are never touched.
+
+    /// The highest source row id this store has accepted for `(serial, stream)`,
+    /// where `stream` is `"events"` or `"readings"`. 0 if none yet.
+    pub fn ingest_watermark(&self, serial: &str, stream: &str) -> Result<i64> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT source_id_max FROM ingest_watermark WHERE serial = ?1 AND stream = ?2",
+                params![serial, stream],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0))
+    }
+
+    /// Highest local `events.id` for a serial (0 if none) — lets a pusher notice a
+    /// rebuilt local DB (local max below the server watermark) and restart from 0.
+    pub fn max_event_id(&self, serial: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM events WHERE serial = ?1",
+                params![serial],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Highest local `readings.id` for a serial (0 if none).
+    pub fn max_reading_id(&self, serial: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM readings WHERE serial = ?1",
+                params![serial],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Read up to `limit` `events` rows with `id > after_id` for a serial, in id order
+    /// — the source side of a push.
+    pub fn events_since(&self, serial: &str, after_id: i64, limit: usize) -> Result<Vec<IngestEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tag, name, ring_timestamp, body, decoded_json, captured_unix
+             FROM events WHERE serial = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![serial, after_id, limit as i64], |r| {
+                Ok(IngestEvent {
+                    source_id: r.get(0)?,
+                    tag: r.get(1)?,
+                    name: r.get(2)?,
+                    ring_timestamp: r.get(3)?,
+                    body: r.get(4)?,
+                    decoded_json: r.get(5)?,
+                    captured_unix: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Read up to `limit` `readings` rows with `id > after_id` for a serial, in id order.
+    pub fn readings_since(
+        &self,
+        serial: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<IngestReading>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, value, unit, captured_unix
+             FROM readings WHERE serial = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![serial, after_id, limit as i64], |r| {
+                Ok(IngestReading {
+                    source_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    value: r.get(2)?,
+                    unit: r.get(3)?,
+                    captured_unix: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Server side: insert a batch of `events` rows verbatim (`INSERT OR IGNORE`) and
+    /// advance the `events` watermark to the batch's highest `source_id`, in one
+    /// transaction. Returns `(rows_inserted, new_watermark)`.
+    pub fn ingest_events(&self, serial: &str, rows: &[IngestEvent]) -> Result<(u32, i64)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut inserted = 0u32;
+        let mut watermark = self.ingest_watermark(serial, "events")?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO events
+                   (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in rows {
+                inserted += stmt.execute(params![
+                    serial,
+                    r.tag,
+                    r.name,
+                    r.ring_timestamp,
+                    r.body,
+                    r.decoded_json,
+                    r.captured_unix,
+                ])? as u32;
+                watermark = watermark.max(r.source_id);
+            }
+        }
+        Self::advance_watermark(&tx, serial, "events", watermark)?;
+        tx.commit()?;
+        Ok((inserted, watermark))
+    }
+
+    /// Server side: insert a batch of `readings` rows and advance the `readings`
+    /// watermark, in one transaction. `readings` has no unique key, so idempotency
+    /// relies entirely on the atomic watermark (a resend only happens before commit).
+    pub fn ingest_readings(&self, serial: &str, rows: &[IngestReading]) -> Result<(u32, i64)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut inserted = 0u32;
+        let mut watermark = self.ingest_watermark(serial, "readings")?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO readings (serial, kind, value, unit, captured_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for r in rows {
+                // Guard against a resent chunk double-inserting if a caller ever pushes
+                // rows at or below the current watermark: only insert genuinely new ids.
+                if r.source_id <= watermark {
+                    continue;
+                }
+                inserted += stmt.execute(params![
+                    serial,
+                    r.kind,
+                    r.value,
+                    r.unit,
+                    r.captured_unix,
+                ])? as u32;
+                watermark = watermark.max(r.source_id);
+            }
+        }
+        Self::advance_watermark(&tx, serial, "readings", watermark)?;
+        tx.commit()?;
+        Ok((inserted, watermark))
+    }
+
+    fn advance_watermark(
+        tx: &Connection,
+        serial: &str,
+        stream: &str,
+        source_id_max: i64,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO ingest_watermark (serial, stream, source_id_max)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(serial, stream)
+               DO UPDATE SET source_id_max = MAX(source_id_max, excluded.source_id_max)",
+            params![serial, stream, source_id_max],
+        )?;
+        Ok(())
+    }
+
+    /// Server side: record device identity and the Mac's last-sync time (for the
+    /// dashboard freshness label) without touching the BLE cursor, in one transaction.
+    pub fn ingest_device(
+        &self,
+        serial: &str,
+        hardware_id: Option<&str>,
+        firmware: Option<&str>,
+        api_version: Option<&str>,
+        mac: Option<&str>,
+        last_sync_unix: i64,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO device (serial, hardware_id, firmware, api_version, mac, updated_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(serial) DO UPDATE SET
+               hardware_id=COALESCE(excluded.hardware_id, device.hardware_id),
+               firmware=COALESCE(excluded.firmware, device.firmware),
+               api_version=COALESCE(excluded.api_version, device.api_version),
+               mac=COALESCE(excluded.mac, device.mac),
+               updated_unix=excluded.updated_unix",
+            params![serial, hardware_id, firmware, api_version, mac, now_unix()],
+        )?;
+        tx.execute(
+            "INSERT INTO sync_state (serial, next_cursor, last_sync_unix)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(serial) DO UPDATE SET last_sync_unix=excluded.last_sync_unix",
+            params![serial, last_sync_unix],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -981,6 +1225,105 @@ mod tests {
             .unwrap();
         assert_eq!(row3_json, "{\"preserved\":true}");
         assert_eq!(store.event_totals().unwrap(), (5, 4));
+    }
+
+    #[test]
+    fn ingest_events_roundtrip_is_idempotent_and_advances_watermark() {
+        let src = Store::open_in_memory().unwrap();
+        for ts in [10u32, 20, 30] {
+            let ev = RingEvent {
+                tag: 0x43,
+                name: "debug_event",
+                timestamp: ts,
+                body: vec![ts as u8],
+                decoded: None,
+            };
+            assert!(src.insert_event("S1", &ev).unwrap());
+        }
+
+        let dst = Store::open_in_memory().unwrap();
+        assert_eq!(dst.ingest_watermark("S1", "events").unwrap(), 0);
+
+        let batch = src.events_since("S1", 0, 100).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(dst.ingest_events("S1", &batch).unwrap(), (3, 3));
+        assert_eq!(dst.ingest_watermark("S1", "events").unwrap(), 3);
+        assert_eq!(dst.event_totals().unwrap(), (3, 0));
+
+        // Resending the same chunk inserts nothing and never regresses the watermark.
+        assert_eq!(dst.ingest_events("S1", &batch).unwrap(), (0, 3));
+        assert_eq!(dst.event_totals().unwrap(), (3, 0));
+
+        // Incremental: one new source row resumes past the watermark.
+        src.insert_event(
+            "S1",
+            &RingEvent { tag: 0x43, name: "debug_event", timestamp: 40, body: vec![40], decoded: None },
+        )
+        .unwrap();
+        let wm = dst.ingest_watermark("S1", "events").unwrap();
+        let next = src.events_since("S1", wm, 100).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].source_id, 4);
+        assert_eq!(dst.ingest_events("S1", &next).unwrap(), (1, 4));
+        assert_eq!(dst.event_totals().unwrap(), (4, 0));
+    }
+
+    #[test]
+    fn ingest_preserves_body_and_decoded_json_verbatim() {
+        let src = Store::open_in_memory().unwrap();
+        src.conn
+            .execute(
+                "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', 66, 'time_sync', 123, X'01020304', '{\"unix_time\":5}', 999)",
+                [],
+            )
+            .unwrap();
+        let dst = Store::open_in_memory().unwrap();
+        let batch = src.events_since("S1", 0, 100).unwrap();
+        dst.ingest_events("S1", &batch).unwrap();
+        let (body, decoded, cap): (Vec<u8>, Option<String>, i64) = dst
+            .conn
+            .query_row(
+                "SELECT body, decoded_json, captured_unix FROM events WHERE serial='S1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, vec![1, 2, 3, 4]);
+        assert_eq!(decoded.as_deref(), Some("{\"unix_time\":5}"));
+        assert_eq!(cap, 999);
+    }
+
+    #[test]
+    fn ingest_readings_watermark_prevents_duplicates() {
+        let src = Store::open_in_memory().unwrap();
+        src.insert_reading("S1", "battery_percent", 90.0, "%").unwrap();
+        src.insert_reading("S1", "battery_percent", 80.0, "%").unwrap();
+
+        let dst = Store::open_in_memory().unwrap();
+        let batch = src.readings_since("S1", 0, 100).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(dst.ingest_readings("S1", &batch).unwrap(), (2, 2));
+
+        // `readings` has no unique key, so the watermark is the only dedup: a resend
+        // must not double-insert.
+        assert_eq!(dst.ingest_readings("S1", &batch).unwrap(), (0, 2));
+        let count: i64 = dst
+            .conn
+            .query_row("SELECT COUNT(*) FROM readings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn ingest_device_sets_last_sync_without_a_cursor() {
+        let dst = Store::open_in_memory().unwrap();
+        dst.ingest_device("S1", Some("HW"), Some("2.1.20"), Some("v1"), Some("AA:BB"), 1_700_000_000)
+            .unwrap();
+        let info = dst.device_info().unwrap().unwrap();
+        assert_eq!(info.0, "S1"); // serial
+        assert_eq!(info.6, 1_700_000_000); // last_sync_unix from the Mac
+        assert_eq!(info.7, 0); // next_cursor stays 0 on the server (no BLE)
     }
 
     fn hex_bytes(s: &str) -> Vec<u8> {

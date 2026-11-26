@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::{Body, Bytes},
-    extract::{Path as AxumPath, RawQuery, Request, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, RawQuery, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -26,6 +26,10 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::net::TcpListener;
+
+use oura_store::Store;
+
+use crate::ingest::{DeviceChunk, EventChunk, EventRow, ReadingChunk, ReadingRow};
 
 use oura_summary::{
     bedtime_overrides_path, feature_modes_path, profile_path, write_bedtime_override, ModelInputs,
@@ -383,8 +387,22 @@ struct AppState {
     name: String,
     key_file: Option<PathBuf>,
     allowed_hosts: Arc<Vec<String>>,
+    /// Present only when `--ingest-token-file` was given: enables `/api/ingest/*` for
+    /// a pushing agent. `None` for a normal local dashboard, so those routes don't
+    /// exist and nothing about local behavior changes.
+    ingest: Option<IngestConfig>,
 }
 
+/// Server-side ingest state: the bearer token to check and the one writable store the
+/// ingest handlers share (SQLite is single-writer, so the `Mutex` serializes writes;
+/// summary reads still use their own read-only connections under WAL).
+#[derive(Clone)]
+struct IngestConfig {
+    token: Arc<String>,
+    store: Arc<Mutex<Store>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     bind: IpAddr,
     port: u16,
@@ -393,6 +411,7 @@ pub async fn serve(
     name: String,
     key_file: Option<PathBuf>,
     allowed_hosts: Vec<String>,
+    ingest_token: Option<String>,
     seed: Demographics,
 ) -> Result<()> {
     // seed profile.json from the CLI demographics on first run; afterwards the
@@ -400,6 +419,23 @@ pub async fn serve(
     if !profile_path(&db).exists() {
         let _ = write_profile(&db, &seed.to_json());
     }
+    // Remote ingest is opt-in: only when a token is configured do we open the store
+    // writable and expose /api/ingest/*. A token read from a file may carry a trailing
+    // newline — trim it so it matches the Authorization header byte-for-byte.
+    let ingest = match ingest_token {
+        Some(token) => {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return Err(anyhow!("ingest token is empty"));
+            }
+            let store = Store::open(&db).context("opening store for ingest")?;
+            Some(IngestConfig {
+                token: Arc::new(token),
+                store: Arc::new(Mutex::new(store)),
+            })
+        }
+        None => None,
+    };
     // Loopback Host values are always accepted, so the local UI keeps working
     // exactly as before; `--allowed-host` only *adds* names for a proxy/ingress.
     let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
@@ -410,6 +446,7 @@ pub async fn serve(
         name,
         key_file,
         allowed_hosts: Arc::new(hosts),
+        ingest,
     };
     let listener = TcpListener::bind((bind, port))
         .await
@@ -436,7 +473,7 @@ fn router(state: AppState) -> Router {
     const HTML: &str = "text/html; charset=utf-8";
     const CSS: &str = "text/css; charset=utf-8";
     const JS: &str = "text/javascript; charset=utf-8";
-    Router::new()
+    let mut app = Router::new()
         .route("/", file!("index.html", INDEX_HTML, HTML))
         .route("/index.html", file!("index.html", INDEX_HTML, HTML))
         .route("/styles.css", file!("styles.css", STYLES_CSS, CSS))
@@ -473,8 +510,20 @@ fn router(state: AppState) -> Router {
         .route("/api/ring-key", get(api_get_ring_key).post(api_post_ring_key))
         .route("/api/sync", post(api_sync))
         .route("/api/live-hr", post(api_live_hr))
-        .route("/api/feature", post(api_feature))
-        .fallback(|| async { resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec()) })
+        .route("/api/feature", post(api_feature));
+    // Remote ingest routes exist only when a token is configured. They carry whole
+    // event/reading chunks, so they get a generous body limit (the rest of the app
+    // keeps axum's small default). `guard` authenticates them by bearer token.
+    if state.ingest.is_some() {
+        let ingest = Router::new()
+            .route("/api/ingest/state", get(api_ingest_state))
+            .route("/api/ingest/events", post(api_ingest_events))
+            .route("/api/ingest/readings", post(api_ingest_readings))
+            .route("/api/ingest/device", post(api_ingest_device))
+            .layer(DefaultBodyLimit::max(32 * 1024 * 1024));
+        app = app.merge(ingest);
+    }
+    app.fallback(|| async { resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec()) })
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -485,6 +534,24 @@ async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response
     let path = req.uri().path().to_string();
     // Health probe must answer without a valid Host (a kubelet probe uses the pod IP).
     if path == "/healthz" {
+        return next.run(req).await;
+    }
+    // Machine-to-machine ingest: authenticated by a constant-time bearer-token check,
+    // not the browser Host/CSRF guards (an agent isn't a browser and sets no Host of
+    // ours). Routes only exist when ingest is configured; this is defence in depth.
+    if path.starts_with("/api/ingest/") {
+        let Some(ingest) = st.ingest.as_ref() else {
+            return resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec());
+        };
+        let presented = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !ct_eq(presented.as_bytes(), ingest.token.as_bytes()) {
+            return resp(StatusCode::UNAUTHORIZED, "text/plain", b"unauthorized".to_vec());
+        }
         return next.run(req).await;
     }
     // Loopback / allowed-host guard (DNS-rebind protection).
@@ -650,6 +717,192 @@ where
         Ok(v) => json_resp(&v),
         Err(e) => json_resp(&json!({ "error": e.to_string() })),
     }
+}
+
+/// Constant-time byte equality for the ingest bearer token (the length is allowed to
+/// leak; the secret's content is not).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ── remote ingest handlers ───────────────────────────────────────────────────────
+// Enabled only when `--ingest-token-file` was set (see `router`). `guard` has already
+// checked the bearer token. Each writes through the single shared `Store` behind a
+// blocking task so SQLite's single writer never blocks the async runtime.
+
+/// Run a blocking closure with the shared ingest store locked. `None` state → 404.
+async fn with_ingest_store<F>(st: &AppState, f: F) -> Response
+where
+    F: FnOnce(&Store) -> (StatusCode, Value) + Send + 'static,
+{
+    let Some(ingest) = st.ingest.clone() else {
+        return resp(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec());
+    };
+    let store = ingest.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("ingest store mutex poisoned");
+        f(&guard)
+    })
+    .await
+    {
+        Ok((status, body)) => resp(
+            status,
+            "application/json",
+            serde_json::to_vec(&body).unwrap_or_default(),
+        ),
+        Err(e) => json_resp(&json!({ "ok": false, "message": e.to_string() })),
+    }
+}
+
+/// `GET /api/ingest/state` — the server's decoder version and per-serial watermarks.
+async fn api_ingest_state(State(st): State<AppState>) -> Response {
+    with_ingest_store(&st, |store| {
+        let build = || -> anyhow::Result<Value> {
+            let mut serials = serde_json::Map::new();
+            for serial in store.device_serials()? {
+                serials.insert(
+                    serial.clone(),
+                    json!({
+                        "events": store.ingest_watermark(&serial, "events")?,
+                        "readings": store.ingest_watermark(&serial, "readings")?,
+                    }),
+                );
+            }
+            Ok(json!({
+                "decoder_version": store.decoder_version()?,
+                "serials": serials,
+            }))
+        };
+        match build() {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "ok": false, "message": e.to_string() }),
+            ),
+        }
+    })
+    .await
+}
+
+/// `POST /api/ingest/events` — insert an event chunk and advance the watermark.
+async fn api_ingest_events(State(st): State<AppState>, body: Bytes) -> Response {
+    let chunk: EventChunk = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return ingest_bad_request(&e.to_string()),
+    };
+    with_ingest_store(&st, move |store| {
+        if let Some(r) = decoder_guard(store, chunk.decoder_version) {
+            return r;
+        }
+        let rows = match chunk
+            .rows
+            .into_iter()
+            .map(EventRow::into_store)
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(r) => r,
+            Err(e) => return ingest_error(&e.to_string()),
+        };
+        match store.ingest_events(&chunk.serial, &rows) {
+            Ok((inserted, watermark)) => ingest_ack(inserted, watermark),
+            Err(e) => ingest_error(&e.to_string()),
+        }
+    })
+    .await
+}
+
+/// `POST /api/ingest/readings` — insert a readings chunk and advance the watermark.
+async fn api_ingest_readings(State(st): State<AppState>, body: Bytes) -> Response {
+    let chunk: ReadingChunk = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return ingest_bad_request(&e.to_string()),
+    };
+    with_ingest_store(&st, move |store| {
+        if let Some(r) = decoder_guard(store, chunk.decoder_version) {
+            return r;
+        }
+        let rows: Vec<_> = chunk.rows.into_iter().map(ReadingRow::into_store).collect();
+        match store.ingest_readings(&chunk.serial, &rows) {
+            Ok((inserted, watermark)) => ingest_ack(inserted, watermark),
+            Err(e) => ingest_error(&e.to_string()),
+        }
+    })
+    .await
+}
+
+/// `POST /api/ingest/device` — device identity, last-sync time, and feature_modes.json.
+async fn api_ingest_device(State(st): State<AppState>, body: Bytes) -> Response {
+    let chunk: DeviceChunk = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return ingest_bad_request(&e.to_string()),
+    };
+    let db = st.db.clone();
+    with_ingest_store(&st, move |store| {
+        if let Err(e) = store.ingest_device(
+            &chunk.serial,
+            chunk.hardware_id.as_deref(),
+            chunk.firmware.as_deref(),
+            chunk.api_version.as_deref(),
+            chunk.mac.as_deref(),
+            chunk.last_sync_unix,
+        ) {
+            return ingest_error(&e.to_string());
+        }
+        // feature_modes.json is a server-written sidecar next to oura.db.
+        if let Some(Value::Object(map)) = chunk.feature_modes {
+            oura_summary::write_feature_modes(&db, map);
+        }
+        ingest_ack(0, 0)
+    })
+    .await
+}
+
+fn decoder_guard(store: &Store, client_version: i64) -> Option<(StatusCode, Value)> {
+    match store.decoder_version() {
+        Ok(server_version) if server_version == client_version => None,
+        Ok(server_version) => Some((
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "message": format!(
+                    "decoder version mismatch: server v{server_version}, client v{client_version}"
+                ),
+            }),
+        )),
+        Err(e) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "ok": false, "message": e.to_string() }),
+        )),
+    }
+}
+
+fn ingest_ack(inserted: u32, watermark: i64) -> (StatusCode, Value) {
+    (
+        StatusCode::OK,
+        json!({ "ok": true, "inserted": inserted, "watermark": watermark }),
+    )
+}
+
+fn ingest_error(message: &str) -> (StatusCode, Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({ "ok": false, "message": message }),
+    )
+}
+
+fn ingest_bad_request(message: &str) -> Response {
+    resp(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        serde_json::to_vec(&json!({ "ok": false, "message": message })).unwrap_or_default(),
+    )
 }
 
 // ── route handlers ─────────────────────────────────────────────────────────────
